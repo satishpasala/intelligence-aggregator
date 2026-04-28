@@ -1,0 +1,95 @@
+# ─── .NET / Visual Studio ───────────────────────────────────────────────────
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]uild/
+[Ll]og/
+[Ll]ogs/
+
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.sln.docstates
+*.rsuser
+*.pidb
+*.svclog
+*.cachefile
+
+.vs/
+
+*.DotSettings.user
+
+TestResults/
+[Tt]est[Rr]esult*/
+BenchmarkDotNet.Artifacts/
+coverage*.json
+coverage*.xml
+coverage*.info
+*.coverage
+*.coveragexml
+
+# Build artifacts
+artifacts/
+*.appx
+*.appxbundle
+
+# Azure Functions local
+local.settings.json
+
+# NuGet
+*.nupkg
+*.snupkg
+**/packages/*
+!**/packages/build/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Rider
+.idea/
+*.sln.iml
+
+# MSBuild Binary and Structured Log
+*.binlog
+
+# ─── Node / npm ─────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# ─── Angular / frontend build ───────────────────────────────────────────────
+dist/
+tmp/
+out-tsc/
+.angular/
+
+# Optional npm cache
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Optional stylelint cache
+.stylelintcache
+
+# ─── Environment & OS ─────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "IntelligenceAggregator.Functions": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 7227",
+      "launchBrowser": false
+    }
+  }
+}
