@@ -1,23 +1,34 @@
 // ============================================================
 // modules/function-app.bicep
 // ============================================================
-// Provisions:
-//   - App Service Plan  (Linux Consumption Y1 – pay-per-execution)
-//   - Azure Function App (.NET 8 isolated worker, system-assigned MI)
+// Provisions a Container App (Consumption, scale-to-zero) that
+// hosts the Azure Functions .NET 9 isolated worker.
 //
-// This Function App hosts ALL application logic:
-//   • HTTP-triggered API endpoints used by the Angular UI and Admin UI
-//   • Timer-triggered background jobs (news, trends, daily briefing)
+// WHY CONTAINER APPS:
+//   The Y1 Consumption and FC1 Flex Consumption App Service plans
+//   require "Dynamic VMs" quota and feature flags that are blocked
+//   on some PAYG subscriptions. Container Apps uses a completely
+//   separate compute quota (Microsoft.App) and has a generous
+//   free grant (180k vCore-s + 360k GB-s/month) at $0.
 //
-// Key Vault references are used for all secrets.
-// KV access (Secrets User role) is granted in key-vault.bicep.
-// CORS is configured to allow the Static Web App origin.
+// INITIAL IMAGE:
+//   On first deploy the container runs the base Functions runtime
+//   image (no code). Deploy your function code after pushing
+//   the custom image to GHCR, then run:
+//     az containerapp update \
+//       --name <functionAppName> --resource-group <rg> \
+//       --image ghcr.io/<user>/intelligence-aggregator-functions:latest
+//
+// The Container Apps Environment is provisioned in container-apps-env.bicep
+// and its resource ID is passed in via containerAppsEnvId.
+// Key Vault access (Secrets User role) is granted in key-vault.bicep.
 // ============================================================
 
 param prefix                      string
 param uniqueSuffix                string
 param location                    string
 param tags                        object
+param containerAppsEnvId          string
 param storageAccountName          string
 param appInsightsConnectionString string
 param environment                 string
@@ -36,163 +47,142 @@ param sqlConnectionStringSecretUri string = ''
 param openAiApiKeySecretUri        string = ''
 param keyVaultUri                  string = ''
 
-var functionAppName = '${prefix}-func-${uniqueSuffix}'
-var planName        = '${prefix}-func-plan'
+@description('GitHub username used to pull the custom image from GHCR (ghcr.io/<user>/...)')
+param ghcrUsername string = ''
 
-// ── Consumption App Service Plan ─────────────────────────────
-// Y1 Consumption = pay only for executions (generous monthly free grant).
-// Perfect for twice-daily timer triggers and low-traffic HTTP APIs.
+@description('GitHub PAT with read:packages scope for pulling private GHCR images')
+@secure()
+param ghcrPat string = ''
 
-resource functionPlan 'Microsoft.Web/serverfarms@2023-12-01' = {
-  name: planName
-  location: location
-  tags: tags
-  kind: 'functionapp,linux'
-  sku: {
-    name: 'Y1'
-    tier: 'Dynamic'
-  }
-  properties: {
-    reserved: true   // Required for Linux Consumption plan
-  }
-}
+// Container Apps name limit is 32 chars.
+var functionAppName = '${take(prefix, 20)}-fn-${uniqueSuffix}'
+var useGhcr         = ghcrUsername != '' && ghcrPat != ''
 
-// Retrieve the storage account to build the AzureWebJobsStorage connection string.
+// ── Storage connection string ─────────────────────────────────
+
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
   name: storageAccountName
 }
 
-var storageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${storageAccount.name};AccountKey=${storageAccount.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+var storageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${storageAccount.name};AccountKey=${storageAccount.listKeys().keys[0].value};EndpointSuffix=${az.environment().suffixes.storage}'
 
-// Build CORS allowed origins – always include the SWA hostname when provided.
+// ── CORS origins ─────────────────────────────────────────────
+
 var corsOrigins = staticWebAppHostname != ''
   ? [ staticWebAppHostname, 'https://portal.azure.com' ]
   : [ 'https://portal.azure.com' ]
 
-// ── Function App ─────────────────────────────────────────────
-// Hosts:
-//   HTTP APIs : /api/briefings/*, /api/trends/*, /api/news/*, /api/admin/*
-//   Timers    : NewsAggregationFunction, TrendAggregationFunction,
-//               DailyBriefingFunction
+// ── Registry (GHCR) ──────────────────────────────────────────
 
-resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
+var registries = useGhcr ? [
+  {
+    server: 'ghcr.io'
+    username: ghcrUsername
+    passwordSecretRef: 'ghcr-pat'
+  }
+] : []
+
+// ── Key Vault secret references (Phase 4 only) ───────────────
+// When KV URIs are provided the Container App pulls secret values
+// using the system-assigned managed identity at container startup.
+// Phase 2 uses placeholder strings; Phase 4 uses proper KV refs.
+
+var useKvSecrets = sqlConnectionStringSecretUri != ''
+
+var kvSecrets = useKvSecrets ? [
+  {
+    name: 'sql-connection-string'
+    keyVaultUrl: sqlConnectionStringSecretUri
+    identity: 'system'
+  }
+  {
+    name: 'openai-api-key'
+    keyVaultUrl: openAiApiKeySecretUri
+    identity: 'system'
+  }
+] : []
+
+var secretEnvVars = useKvSecrets ? [
+  { name: 'ConnectionStrings__DefaultConnection', secretRef: 'sql-connection-string' }
+  { name: 'OpenAI__ApiKey',                       secretRef: 'openai-api-key' }
+] : [
+  { name: 'ConnectionStrings__DefaultConnection', value: 'PLACEHOLDER_SET_AFTER_DEPLOY' }
+  { name: 'OpenAI__ApiKey',                       value: 'PLACEHOLDER_SET_AFTER_DEPLOY' }
+]
+
+// ── Secrets array: GHCR PAT + KV refs ────────────────────────
+
+var ghcrSecrets = useGhcr ? [{ name: 'ghcr-pat', value: ghcrPat }] : []
+var allSecrets  = concat(ghcrSecrets, kvSecrets)
+
+// ── Base environment variables ────────────────────────────────
+
+var baseEnvVars = [
+  { name: 'AzureWebJobsStorage',                        value: storageConnectionString }
+  { name: 'FUNCTIONS_EXTENSION_VERSION',                value: '~4' }
+  { name: 'FUNCTIONS_WORKER_RUNTIME',                   value: 'dotnet-isolated' }
+  { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING',      value: appInsightsConnectionString }
+  { name: 'ApplicationInsightsAgent_EXTENSION_VERSION', value: '~3' }
+  { name: 'ASPNETCORE_ENVIRONMENT',                     value: environment }
+  { name: 'KeyVault__VaultUri',                         value: keyVaultUri }
+  { name: 'OpenAI__Model',                              value: openAiModel }
+  { name: 'Aggregation__NewsSchedule',                  value: newsSchedule }
+  { name: 'Aggregation__TrendSchedule',                 value: trendSchedule }
+  { name: 'Aggregation__BriefingSchedule',              value: briefingSchedule }
+  { name: 'Aggregation__MaxArticlesPerRun',             value: string(maxArticlesPerRun) }
+  { name: 'AppSettings__MaxArticlesPerRun',             value: string(maxArticlesPerRun) }
+  { name: 'AppSettings__MaxAiCallsPerDay',              value: string(maxAiCallsPerDay) }
+  { name: 'AppSettings__EnableAiSummaries',             value: string(enableAiSummaries) }
+]
+
+// ── Container App ─────────────────────────────────────────────
+// Hosts the Azure Functions runtime (.NET 9 isolated worker).
+// Scale-to-zero keeps cost at $0 during idle periods.
+
+resource functionApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: functionAppName
   location: location
   tags: tags
-  kind: 'functionapp,linux'
   identity: {
-    type: 'SystemAssigned'   // Managed identity – no stored credentials
+    type: 'SystemAssigned'
   }
   properties: {
-    serverFarmId: functionPlan.id
-    httpsOnly: true          // Redirect all HTTP → HTTPS
-    siteConfig: {
-      linuxFxVersion: 'DOTNET-ISOLATED|8.0'   // .NET 8 isolated worker
-      minTlsVersion: '1.2'
-      http20Enabled: true
-      cors: {
-        // Allow the Angular Static Web App to call these HTTP endpoints.
-        // Add additional origins here if you add a custom domain later.
-        allowedOrigins: corsOrigins
-        supportCredentials: false
+    environmentId: containerAppsEnvId
+    workloadProfileName: 'Consumption'
+    configuration: {
+      secrets: allSecrets
+      registries: registries
+      ingress: {
+        external: true
+        targetPort: 80
+        corsPolicy: {
+          allowedOrigins: corsOrigins
+          allowedMethods: [ 'GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH' ]
+          allowedHeaders: [ '*' ]
+          allowCredentials: false
+        }
       }
-      appSettings: [
-        // ── Functions runtime ────────────────────────────────
+    }
+    template: {
+      containers: [
         {
-          name: 'FUNCTIONS_EXTENSION_VERSION'
-          value: '~4'
-        }
-        {
-          name: 'FUNCTIONS_WORKER_RUNTIME'
-          value: 'dotnet-isolated'
-        }
-        {
-          // Storage account used by the Functions host (triggers, leases, state)
-          name: 'AzureWebJobsStorage'
-          value: storageConnectionString
-        }
-
-        // ── Application Insights ─────────────────────────────
-        {
-          name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
-          value: appInsightsConnectionString
-        }
-        {
-          name: 'ApplicationInsightsAgent_EXTENSION_VERSION'
-          value: '~3'
-        }
-
-        // ── ASP.NET Core environment ─────────────────────────
-        {
-          // Controls ASP.NET Core middleware behaviour inside isolated worker
-          name: 'ASPNETCORE_ENVIRONMENT'
-          value: environment
-        }
-
-        // ── Key Vault ────────────────────────────────────────
-        {
-          name: 'KeyVault__VaultUri'
-          value: keyVaultUri
-        }
-
-        // ── Secrets (Key Vault references) ───────────────────
-        // The managed identity resolves these at runtime.
-        // Values are placeholders until KV is provisioned (Phase 3).
-        {
-          name: 'ConnectionStrings__DefaultConnection'
-          value: sqlConnectionStringSecretUri != ''
-            ? '@Microsoft.KeyVault(SecretUri=${sqlConnectionStringSecretUri})'
-            : 'PLACEHOLDER_SET_AFTER_DEPLOY'
-        }
-        {
-          name: 'OpenAI__ApiKey'
-          value: openAiApiKeySecretUri != ''
-            ? '@Microsoft.KeyVault(SecretUri=${openAiApiKeySecretUri})'
-            : 'PLACEHOLDER_SET_AFTER_DEPLOY'
-        }
-
-        // ── OpenAI ───────────────────────────────────────────
-        {
-          name: 'OpenAI__Model'
-          value: openAiModel
-        }
-
-        // ── Aggregation timer schedules (NCRONTAB, UTC) ──────
-        // Format: {second} {minute} {hour} {day} {month} {day-of-week}
-        {
-          // NewsAggregationFunction: 06:00 and 18:00 UTC daily
-          name: 'Aggregation__NewsSchedule'
-          value: newsSchedule
-        }
-        {
-          // TrendAggregationFunction: 06:15 and 18:15 UTC daily
-          name: 'Aggregation__TrendSchedule'
-          value: trendSchedule
-        }
-        {
-          // DailyBriefingFunction: 06:30 and 18:30 UTC daily
-          name: 'Aggregation__BriefingSchedule'
-          value: briefingSchedule
-        }
-
-        // ── Application tuning ───────────────────────────────
-        {
-          name: 'Aggregation__MaxArticlesPerRun'
-          value: string(maxArticlesPerRun)
-        }
-        {
-          name: 'AppSettings__MaxArticlesPerRun'
-          value: string(maxArticlesPerRun)
-        }
-        {
-          name: 'AppSettings__MaxAiCallsPerDay'
-          value: string(maxAiCallsPerDay)
-        }
-        {
-          name: 'AppSettings__EnableAiSummaries'
-          value: string(enableAiSummaries)
+          name: 'functions'
+          // Public placeholder – replaced by ghcr.io/<user>/intelligence-aggregator-functions:latest
+          // after your first docker push.
+          image: useGhcr
+            ? 'ghcr.io/${ghcrUsername}/intelligence-aggregator-functions:latest'
+            : 'mcr.microsoft.com/azure-functions/dotnet-isolated:4-dotnet-isolated9.0'
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+          env: concat(baseEnvVars, secretEnvVars)
         }
       ]
+      scale: {
+        minReplicas: 0    // Scale to zero when idle – no idle cost
+        maxReplicas: 10
+      }
     }
   }
 }
@@ -202,8 +192,8 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
 @description('System-assigned managed identity principal ID')
 output principalId string = functionApp.identity.principalId
 
-@description('Name of the Function App')
+@description('Name of the Container App (Function App)')
 output functionAppName string = functionApp.name
 
-@description('Default HTTPS hostname of the Function App')
-output defaultHostname string = 'https://${functionApp.properties.defaultHostName}'
+@description('Default HTTPS hostname of the Container App')
+output defaultHostname string = 'https://${functionApp.properties.configuration.ingress.fqdn}'

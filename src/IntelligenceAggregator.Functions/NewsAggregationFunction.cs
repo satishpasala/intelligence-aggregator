@@ -13,7 +13,7 @@ public sealed class NewsAggregationFunction
     }
 
     [Function(nameof(RunNewsAggregation))]
-    public Task RunNewsAggregation([TimerTrigger("0 */15 * * * *")] TimerInfo timerInfo, CancellationToken cancellationToken)
+    public Task RunNewsAggregation([TimerTrigger("%Aggregation__NewsSchedule%")] TimerInfo timerInfo, CancellationToken cancellationToken)
     {
         _logger.LogInformation("News aggregation started.");
         return Task.CompletedTask;

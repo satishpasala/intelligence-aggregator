@@ -28,6 +28,9 @@ param openAiApiKey string
 @description('Principal ID of the Function App managed identity')
 param functionAppPrincipalId string
 
+@description('Principal ID of the API App Service managed identity')
+param apiAppPrincipalId string = ''
+
 var keyVaultName = take('${replace(prefix, '-', '')}kv${uniqueSuffix}', 24)
 
 // Key Vault Secrets User role definition ID (built-in)
@@ -48,7 +51,6 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
     enableRbacAuthorization: true              // Use Azure RBAC (not legacy access policies)
     enableSoftDelete: true
     softDeleteRetentionInDays: 7              // Minimum retention; reduce recovery cost
-    enablePurgeProtection: false             // Allow manual purge in dev
     publicNetworkAccess: 'Enabled'
     networkAcls: {
       defaultAction: 'Allow'
@@ -89,6 +91,18 @@ resource functionAppKvRole 'Microsoft.Authorization/roleAssignments@2022-04-01' 
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', keyVaultSecretsUserRoleId)
     principalId: functionAppPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ── RBAC: API App Service → Key Vault Secrets User ───────────
+
+resource apiAppKvRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (apiAppPrincipalId != '') {
+  scope: keyVault
+  name: guid(keyVault.id, apiAppPrincipalId, keyVaultSecretsUserRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', keyVaultSecretsUserRoleId)
+    principalId: apiAppPrincipalId
     principalType: 'ServicePrincipal'
   }
 }

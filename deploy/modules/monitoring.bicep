@@ -25,6 +25,11 @@ resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09
       name: 'PerGB2018'
     }
     retentionInDays: 30
+    // Cap at 0.1 GB/day (~3 GB/month) to stay well inside the 5 GB/month
+    // free allowance and prevent unexpected charges in dev.
+    workspaceCapping: {
+      dailyQuotaGb: json('0.1')
+    }
     publicNetworkAccessForIngestion: 'Enabled'
     publicNetworkAccessForQuery: 'Enabled'
   }

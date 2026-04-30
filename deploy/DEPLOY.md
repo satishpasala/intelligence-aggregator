@@ -1,26 +1,50 @@
 # Intelligence Aggregator – Azure Deployment Guide
 
-This guide covers everything needed to deploy the full Azure infrastructure
-using the Bicep templates in this folder.
+This guide deploys the full infrastructure at **near-zero monthly cost** using only
+free or free-tier Azure services, plus GitHub Container Registry (GHCR) for images.
 
 ---
 
-## Folder Structure
+## Monthly cost summary
+
+| Resource | Cost |
+|----------|------|
+| Static Web App (Free tier) | **$0** |
+| Container Apps – API (Consumption, scale-to-zero) | **$0** |
+| Container Apps – Functions (Consumption, scale-to-zero) | **$0** |
+| Container Apps Environment (Consumption profile) | **$0** |
+| Azure SQL Database (serverless, free offer) | **$0** |
+| Key Vault (≤10k ops/month) | **$0** |
+| Application Insights (workspace-based, ≤5 GB) | **$0** |
+| Log Analytics (≤5 GB/month free) | **$0** |
+| **Storage Account (LRS)** | **~$1–2/mo** |
+| **GitHub Container Registry** | **$0** |
+| **Total** | **~$1–2/month** |
+
+> Storage Account is unavoidable — it's required by the Azure Functions runtime for
+> host coordination, queue triggers, and timer state. Everything else is free.
+
+---
+
+## Architecture
 
 ```
 deploy/
-├── main.bicep                    # Root orchestrator – deploys all modules
+├── main.bicep
 ├── parameters/
-│   └── dev.bicepparam            # Dev environment parameter values
+│   └── dev.bicepparam
 └── modules/
-    ├── monitoring.bicep          # Log Analytics Workspace + Application Insights
-    ├── storage.bicep             # Storage Account (required by Functions)
-    ├── sql.bicep                 # Azure SQL Server + Database
-    ├── key-vault.bicep           # Key Vault + secrets + RBAC assignments
-    ├── static-web-app.bicep      # Angular Static Web App
-    ├── app-service.bicep         # App Service Plan + .NET Web API
-    └── function-app.bicep        # Consumption Function App (timer triggers)
+    ├── monitoring.bicep          # Log Analytics + Application Insights
+    ├── storage.bicep             # Storage Account (Functions host storage)
+    ├── sql.bicep                 # Azure SQL Server + Database (free serverless)
+    ├── key-vault.bicep           # Key Vault + secrets + RBAC
+    ├── static-web-app.bicep      # Angular SPA (Free tier)
+    ├── container-apps-env.bicep  # Shared Container Apps Environment (Consumption)
+    ├── api-container-app.bicep   # .NET 9 Web API Container App
+    └── function-app.bicep        # Azure Functions Container App (timer triggers)
 ```
+
+Images are stored in **GitHub Container Registry (ghcr.io)** — free for all GitHub accounts.
 
 ---
 
@@ -31,22 +55,35 @@ deploy/
 | Azure CLI | 2.57+ | https://aka.ms/installazurecli |
 | Bicep CLI | 0.26+ | `az bicep install` |
 | .NET SDK | 9.0 | https://dotnet.microsoft.com |
+| Docker Desktop | latest | https://www.docker.com/products/docker-desktop |
 | Node.js | 20 LTS | For SWA CLI |
 | Azure Static Web Apps CLI | latest | `npm i -g @azure/static-web-apps-cli` |
 
 ---
 
-## Step 1 – Replace Placeholder Values
+## Step 1 – Create a GitHub PAT for GHCR
+
+Go to **https://github.com/settings/tokens → Generate new token (classic)**
+
+Required scopes:
+- `read:packages` — for Container Apps to pull images at runtime
+- `write:packages` — for `docker push` from your local machine
+
+Keep the token value handy; you will pass it as `--parameters ghcrPat=<token>` during deploy.
+
+---
+
+## Step 2 – Replace Placeholder Values
 
 Open `parameters/dev.bicepparam` and replace every value marked `← REPLACE`:
 
 | Parameter | Description |
 |-----------|-------------|
-| `location` | Azure region, e.g. `eastus` or `westeurope` |
+| `location` | Azure region, e.g. `eastus` |
 | `uniqueSuffix` | 6-char suffix (see tip below) |
-| `sqlAdminObjectId` | AAD Object ID of the deploying user / service principal |
-| `sqlAdminPassword` | Strong SQL password (min 12 chars, mixed case + symbol + digit) |
-| `openAiApiKey` | Your OpenAI API key (or set it post-deploy in Key Vault) |
+| `sqlAdminObjectId` | AAD Object ID of the deploying user |
+| `sqlAdminPassword` | Strong SQL password |
+| `ghcrUsername` | Your GitHub username |
 
 **Generate a stable uniqueSuffix (PowerShell):**
 ```powershell
@@ -62,7 +99,7 @@ az ad signed-in-user show --query id -o tsv
 
 ---
 
-## Step 2 – Login and Set Subscription
+## Step 3 – Login and Set Subscription
 
 ```bash
 az login
@@ -71,28 +108,29 @@ az account set --subscription "<YOUR_SUBSCRIPTION_ID>"
 
 ---
 
-## Step 3 – Deploy the Infrastructure
+## Step 4 – Deploy the Infrastructure
 
 ```bash
 az deployment group create \
   --resource-group "<YOUR_RESOURCE_GROUP_NAME>" \
   --template-file deploy/main.bicep \
   --parameters deploy/parameters/dev.bicepparam \
+  --parameters ghcrPat="<YOUR_GITHUB_PAT>" \
   --name "intelligence-aggregator-deploy-$(date +%Y%m%d%H%M%S)"
 ```
 
-The deployment runs in 4 phases (Bicep handles ordering automatically):
+The deployment runs in 4 phases (Bicep handles ordering):
 
-1. **Foundation** – Monitoring, Storage, SQL, Static Web App (parallel)
-2. **Compute** – App Service and Function App (to get managed identity IDs)
-3. **Key Vault** – Create vault, store secrets, assign RBAC
-4. **Config** – Re-apply app settings with Key Vault references wired in
+1. **Foundation** – Monitoring, Storage, SQL, Static Web App, Container Apps Env (parallel)
+2. **Compute** – API Container App + Functions Container App (to get managed identity IDs)
+3. **Secrets** – Key Vault (creates vault, stores secrets, assigns Secrets User to both identities)
+4. **Config** – Re-deploys both Container Apps with real Key Vault secret references
 
 Estimated deploy time: **8–15 minutes**.
 
 ---
 
-## Step 4 – Capture Outputs
+## Step 5 – Capture Outputs
 
 ```bash
 az deployment group show \
@@ -106,148 +144,148 @@ Key outputs:
 | Output | Description |
 |--------|-------------|
 | `staticWebAppUrl` | Angular app public URL |
-| `apiUrl` | .NET Web API HTTPS URL |
-| `functionAppName` | Function App name (for CI/CD) |
+| `apiUrl` | .NET Web API HTTPS URL (Container App) |
+| `functionAppName` | Functions Container App name |
 | `sqlServerName` | SQL Server FQDN |
-| `sqlDatabaseName` | SQL Database name |
 | `keyVaultUri` | Key Vault URI |
-| `appInsightsConnectionString` | AI connection string |
 
 ---
 
-## Step 5 – Set the Real OpenAI API Key
-
-The parameter file contains a placeholder. Set the real key in Key Vault:
+## Step 6 – Set the Real OpenAI API Key
 
 ```bash
 KV_NAME=$(az keyvault list --resource-group "<YOUR_RG>" --query "[0].name" -o tsv)
-
-az keyvault secret set \
-  --vault-name "$KV_NAME" \
-  --name "OpenAiApiKey" \
-  --value "<YOUR_REAL_OPENAI_API_KEY>"
+az keyvault secret set --vault-name "$KV_NAME" --name "OpenAiApiKey" --value "<YOUR_KEY>"
 ```
 
-Then restart both apps to pick up the new secret:
+Restart both Container Apps to pick up the new secret:
 
 ```bash
 RG="<YOUR_RESOURCE_GROUP_NAME>"
-APP_NAME=$(az webapp list -g $RG --query "[?contains(name, 'api')].name" -o tsv)
-FUNC_NAME=$(az functionapp list -g $RG --query "[0].name" -o tsv)
-
-az webapp restart --name "$APP_NAME" --resource-group "$RG"
-az functionapp restart --name "$FUNC_NAME" --resource-group "$RG"
+az containerapp revision restart \
+  --name $(az containerapp list -g $RG --query "[?contains(name,'api')].name" -o tsv) \
+  --resource-group "$RG"
+az containerapp revision restart \
+  --name $(az containerapp list -g $RG --query "[?contains(name,'-fn-')].name" -o tsv) \
+  --resource-group "$RG"
 ```
 
 ---
 
-## Step 6 – Run Database Migrations
-
-The infrastructure creates the SQL Server and Database only.
-Apply EF Core migrations from the application:
+## Step 7 – Run Database Migrations
 
 ```bash
 cd src/IntelligenceAggregator.Api
-
-# Set the connection string for the local migration tool
 $env:ConnectionStrings__DefaultConnection = "<SQL_CONNECTION_STRING>"
-
 dotnet ef database update --project ../IntelligenceAggregator.Infrastructure
 ```
 
 ---
 
-## Step 7 – Deploy the Angular Frontend
+## Step 8 – Deploy the Angular Frontend
 
 ```bash
 cd src/IntelligenceAggregator.Web
-
-# Build the Angular app
 npm install
 npm run build -- --configuration production
 
-# Deploy to Static Web Apps
 SWA_NAME=$(az staticwebapp list -g "<YOUR_RG>" --query "[0].name" -o tsv)
 SWA_TOKEN=$(az staticwebapp secrets list --name "$SWA_NAME" --query "properties.apiKey" -o tsv)
 
-swa deploy ./dist/intelligence-aggregator-web \
+swa deploy ./dist/IntelligenceAggregator.Web/browser \
   --deployment-token "$SWA_TOKEN" \
   --env production
 ```
 
 ---
 
-## Step 8 – Deploy the .NET Web API
+## Step 9 – Build and Push Images to GHCR
+
+Run from the **repo root** (where `.dockerignore` lives).
 
 ```bash
-cd src/IntelligenceAggregator.Api
-dotnet publish -c Release -o ./publish
+GHCR_USER="<YOUR_GITHUB_USERNAME>"
 
-APP_NAME="intelligence-aggregator-dev-api"   # adjust if prefix differs
-RG="<YOUR_RESOURCE_GROUP_NAME>"
+# Authenticate Docker with GHCR (uses the same PAT from Step 1)
+echo "<YOUR_GITHUB_PAT>" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-az webapp deploy \
-  --resource-group "$RG" \
-  --name "$APP_NAME" \
-  --src-path ./publish \
-  --type zip
+# Build and push the Functions image
+docker build \
+  -f src/IntelligenceAggregator.Functions/Dockerfile \
+  -t "ghcr.io/$GHCR_USER/intelligence-aggregator-functions:latest" \
+  .
+docker push "ghcr.io/$GHCR_USER/intelligence-aggregator-functions:latest"
+
+# Build and push the API image
+docker build \
+  -f src/IntelligenceAggregator.Api/Dockerfile \
+  -t "ghcr.io/$GHCR_USER/intelligence-aggregator-api:latest" \
+  .
+docker push "ghcr.io/$GHCR_USER/intelligence-aggregator-api:latest"
 ```
+
+> **GHCR visibility**: After pushing, go to your GitHub profile → Packages and set
+> each package to **Private** (default) or **Public**. If Private, the GHCR PAT
+> you supplied in Step 4 is used by Container Apps to pull at runtime.
 
 ---
 
-## Step 9 – Deploy the Function App
+## Step 10 – Update Container Apps with Real Images
+
+After pushing, point the Container Apps at the custom images:
 
 ```bash
-cd src/IntelligenceAggregator.Functions
-dotnet publish -c Release -o ./publish
+RG="<YOUR_RESOURCE_GROUP_NAME>"
+GHCR_USER="<YOUR_GITHUB_USERNAME>"
 
-FUNC_NAME=$(az functionapp list -g "<YOUR_RG>" --query "[0].name" -o tsv)
+API_APP=$(az containerapp list -g $RG --query "[?contains(name,'api')].name" -o tsv)
+FN_APP=$(az containerapp list -g $RG --query "[?contains(name,'-fn-')].name" -o tsv)
 
-az functionapp deployment source config-zip \
-  --resource-group "<YOUR_RG>" \
-  --name "$FUNC_NAME" \
-  --src ./publish.zip
+az containerapp update --name "$API_APP" --resource-group "$RG" \
+  --image "ghcr.io/$GHCR_USER/intelligence-aggregator-api:latest"
+
+az containerapp update --name "$FN_APP" --resource-group "$RG" \
+  --image "ghcr.io/$GHCR_USER/intelligence-aggregator-functions:latest"
 ```
+
+> **Subsequent deploys**: just rebuild, push, and run `az containerapp update` again.
 
 ---
 
 ## Resource Explanation
 
-| Resource | SKU / Tier | Purpose |
-|----------|-----------|---------|
-| Log Analytics Workspace | PerGB2018 | Centralised log store |
-| Application Insights | Workspace-based | APM telemetry for API + Functions |
-| Storage Account | Standard_LRS | Azure Functions host storage |
-| SQL Server | – | Logical SQL server (AAD + SQL auth) |
-| SQL Database | GP_S_Gen5 (serverless, 1 vCore) | App data, auto-pauses when idle |
-| Key Vault | Standard | Secrets management, no hardcoded credentials |
-| Static Web App | Free | Angular public + admin UI |
-| App Service Plan | B1 Linux | Hosts the .NET Web API |
-| App Service | .NET 9 Linux | .NET Web API |
-| Function App | Consumption Linux | Timer-triggered aggregation jobs |
+| Resource | SKU / Tier | Cost | Purpose |
+|----------|-----------|------|---------|
+| Log Analytics Workspace | PerGB2018 | $0 (≤5 GB free) | Log storage |
+| Application Insights | Workspace-based | $0 | APM telemetry |
+| Storage Account | Standard LRS | ~$1–2/mo | Functions host storage |
+| SQL Server | – | $0 | Logical SQL server |
+| SQL Database | GP_S_Gen5 serverless | $0 (free offer) | App data, auto-pauses |
+| Key Vault | Standard | $0 (≤10k ops) | Secrets |
+| Static Web App | Free | $0 | Angular SPA |
+| Container Apps Environment | Consumption | $0 | Shared runtime env |
+| Container App – API | Consumption, scale-to-zero | $0 | .NET Web API |
+| Container App – Functions | Consumption, scale-to-zero | $0 | Timer jobs |
+| GitHub Container Registry | Free | $0 | Docker image storage |
 
 ---
 
 ## Security Notes
 
-- All secrets are stored in Key Vault; no plaintext secrets in app settings.
-- App Service and Function App use **system-assigned managed identities**;
-  they authenticate to Key Vault and SQL via AAD – no passwords needed at runtime.
-- HTTPS only is enforced on both App Service and Function App.
-- TLS 1.2 minimum is set on SQL Server, Storage, App Service, and Function App.
-- Public blob write access is disabled on the Storage Account.
-- In production, tighten the SQL Server firewall to specific IP ranges and
-  set `publicNetworkAccess: 'Disabled'` behind a VNet.
+- All secrets live in Key Vault; no plaintext credentials in app settings.
+- Both Container Apps use **system-assigned managed identities** for Key Vault access.
+- GHCR pull credentials are stored as Container App secrets (not in app settings).
+- TLS is terminated by the Container App ingress; apps communicate over HTTP internally.
+- SQL uses AAD Default auth at runtime (managed identity); SQL password is for admin only.
+- In production, set `publicNetworkAccess: 'Disabled'` on SQL and Key Vault behind a VNet.
 
 ---
 
 ## Tearing Down
 
 ```bash
-# Delete all resources by removing the resource group (irreversible!)
 az group delete --name "<YOUR_RESOURCE_GROUP_NAME>" --yes --no-wait
 ```
 
-> **Warning:** This deletes everything including the SQL database and Key Vault.
-> Key Vault enters soft-delete state for 7 days; purge manually if needed:
+> Key Vault enters soft-delete for 7 days. Purge manually if needed:
 > `az keyvault purge --name <kv-name>`

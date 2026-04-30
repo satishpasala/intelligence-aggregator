@@ -1,0 +1,9 @@
+**/.git
+**/.vs
+**/bin
+**/obj
+**/node_modules
+**/*.user
+**/local.settings.json
+**/.env*
+**/publish
